@@ -45,9 +45,13 @@ static bool confirmAttack(const String &msg) {
     tft.setTextColor(TFT_CYAN, bruceConfig.bgColor);
     tft.print("[SEL] Yes  [ESC] No");
 
-    while (!check(SelPress) && !check(EscPress)) delay(50);
-    delay(200);
-    return check(SelPress);
+    // check() consumes the flag, so return on whichever key fires first —
+    // re-reading the flag afterwards would always return false on a quick tap.
+    while (true) {
+        if (check(EscPress)) return false;
+        if (check(SelPress)) return true;
+        delay(50);
+    }
 }
 #include <Arduino.h>
 #include <globals.h>
@@ -995,8 +999,15 @@ void enhancedDeauthMenu() {
 
 void wifi_bruteforce_menu() {
     resetGlobalState();
+    memset(&ap_record, 0, sizeof(ap_record)); // no stale target from a previous session
 
-    if (WiFi.getMode() == WIFI_MODE_NULL) wifi_complete_cleanup(false);
+    // Make sure the radio is on before scanning. scanNetworks() fails or
+    // returns 0 while the WiFi driver is fully powered off.
+    if (WiFi.getMode() == WIFI_MODE_NULL) {
+        wifi_complete_cleanup(false);
+        WiFi.mode(WIFI_STA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 
     // Step 1: Scan and select target AP
     int nets;
@@ -1044,23 +1055,9 @@ void wifi_bruteforce_menu() {
     String targetBSSID = macToStr(ap_record.bssid);
     uint8_t targetChannel = ap_record.primary;
 
-    // Step 2: Select wordlist source (built-in or file)
-    options.clear();
-    options.push_back({"Built-in Common Passwords (32)", []() {}});
-    options.push_back({"Wordlist File (.txt/.lst/.csv)", []() {}});
-    options.push_back({"Back", [&]() { returnToMenu = true; }});
-    addOptionToMainMenu();
-    loopOptions(options);
-    if (returnToMenu) return;
-
-    // We need to know which option was selected
-    // Since we can't easily tell from the lambda, use a different approach
-    // Check if we have a wordlist file selected via loopSD
-    bool useBuiltin = false;
+    // Step 2: Select wordlist source using menu
     String wordlistPath = "";
     std::vector<String> passwords;
-
-    // Step 2: Select wordlist source using menu
     static int bf_source_choice = -1;
     bf_source_choice = -1;
 
@@ -1080,7 +1077,6 @@ void wifi_bruteforce_menu() {
     bf_source_choice = -1;
 
     if (sourceChoice == 1) {
-        useBuiltin = true;
         passwords = {"12345678",    "123456789", "password",   "admin",    "admin123",  "1234567890",
                      "qwerty",      "abc123",    "letmein",    "welcome",  "admin1234", "password1",
                      "password123", "123456789", "12345678",   "11111111", "00000000",  "88888888",
