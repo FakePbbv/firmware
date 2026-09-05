@@ -419,6 +419,7 @@ void init_led() {
  **  Function: startup_sound
  **  Play sound or tone depending on device hardware
  *********************************************************************/
+
 void startup_sound() {
     if (bruceConfig.soundEnabled == 0) return; // if sound is disabled, do not play sound
 #if !defined(LITE_VERSION)
