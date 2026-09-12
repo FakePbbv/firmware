@@ -7,23 +7,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-//=============================================================================
-// BLE jammer implementation
-//
-// Hopping modes (HOP_ADV / HOP_ALL / ADV_CHANNELS / ALL_CHANNELS) are driven by
-// a background FreeRTOS task so they keep hopping even while the caller blocks
-// in UI code (e.g. BLE_Suite's showDeviceInfoScreen()). stopBLEJammer() tears
-// the task down. updateBLEJammer() remains public for manual/custom callers;
-// it is idempotent and safe to call alongside the task.
-//=============================================================================
-
-// BLE uses nRF24 channels 0-39: 0-36 are data channels, 37/38/39 are the
-// advertising channels (2402/2426/2480 MHz). The nRF channel number == the
-// BLE channel number, so a single 0..39 sweep covers the whole BLE band.
-static byte bleAllChannels[40];
-static byte bleAdvertisingChannels[] = {37, 38, 39};
-
-#define BLE_HOP_INTERVAL_MS 100 // dwell time per channel while hopping
+#define BLE_HOP_INTERVAL_MS 100
 #define JAM_TASK_PRIORITY 1
 #define JAM_TASK_STACK 2048
 
@@ -35,14 +19,23 @@ static unsigned long lastChannelHop = 0;
 static int currentChannelIndex = 0;
 static int targetChannel = 0;
 static bool isHopping = false;
-static byte *hopTable = NULL;     // active hop set (single source of truth)
-static int hopTableCount = 0;     // number of channels in hopTable
+static byte *hopTable = NULL;
+static int hopTableCount = 0;
 static TaskHandle_t jammerTaskHandle = NULL;
 
-// Full power cycle for reliable channel changes. Bare setChannel() during
-// active CW leaves the PLL in an undefined state on many PA+LNA modules —
-// the carrier freezes or stops after the first hop. powerUp() also needs the
-// ~1.5ms crystal oscillator settle time, hence the delay(2).
+static byte bleAllChannels[40];
+static byte bleAdvertisingChannels[] = {2, 26, 80};
+static byte bleDataChannels[37];
+
+static void initBleChannels() {
+    for (int i = 0; i < 40; i++) {
+        bleAllChannels[i] = 2 + i * 2;
+    }
+    for (int i = 0; i < 37; i++) {
+        bleDataChannels[i] = 4 + i * 2;
+    }
+}
+
 static void setRadioChannel(uint8_t channel) {
     NRFradio.stopConstCarrier();
     delayMicroseconds(500);
@@ -51,7 +44,6 @@ static void setRadioChannel(uint8_t channel) {
     NRFradio.powerUp();
     delay(2);
     NRFradio.setChannel(channel);
-    // Re-apply settings — the power cycle clears radio registers
     NRFradio.setPALevel(currentPowerLevel);
     NRFradio.setDataRate(RF24_2MBPS);
     NRFradio.setAddressWidth(3);
@@ -75,7 +67,7 @@ bool isNRF24Available() {
                     NRFradio.setDataRate(RF24_250KBPS);
                 }
             }
-            for (int i = 0; i < 40; i++) bleAllChannels[i] = i;
+            initBleChannels();
             nrf24Initialized = true;
         }
     }
@@ -87,7 +79,6 @@ bool startBLEJammer(BLEJamMode mode, int param) {
     NRF24_MODE nrfMode = nrf_setMode();
     if (!CHECK_NRF_SPI(nrfMode)) return false;
 
-    // A previous session may still be running (task + CW carrier)
     stopBLEJammer();
 
     currentMode = mode;
@@ -111,7 +102,7 @@ bool startBLEJammer(BLEJamMode mode, int param) {
             break;
         case BLE_JAM_TARGET_CHANNEL:
             if (param < 0 || param > 39) return false;
-            targetChannel = param;
+            targetChannel = 2 + param * 2;
             break;
         default:
             return false;
@@ -127,8 +118,7 @@ bool startBLEJammer(BLEJamMode mode, int param) {
     bleJammingActive = true;
     lastChannelHop = millis();
 
-    if (xTaskCreate(bleJammerTask, "bleJammer", JAM_TASK_STACK, NULL, JAM_TASK_PRIORITY, &jammerTaskHandle) !=
-        pdPASS) {
+    if (xTaskCreate(bleJammerTask, "bleJammer", JAM_TASK_STACK, NULL, JAM_TASK_PRIORITY, &jammerTaskHandle) != pdPASS) {
         jammerTaskHandle = NULL;
     }
     return true;
@@ -160,7 +150,7 @@ void stopBLEJammer() {
     NRF24_MODE mode = nrf_setMode();
     if (CHECK_NRF_SPI(mode) && nrf24Initialized) {
         NRFradio.stopConstCarrier();
-        NRFradio.powerDown(); // explicit power-down for clean shutdown
+        NRFradio.powerDown();
     }
     bleJammingActive = false;
     isHopping = false;
@@ -188,8 +178,6 @@ void setBLEJammingPower(int powerLevel) {
 
     currentPowerLevel = paLevel;
     if (!bleJammingActive || !nrf24Initialized) return;
-    // Re-apply the power level to the channel currently being jammed
-    // without tearing down the hopping session.
     uint8_t ch = (currentMode == BLE_JAM_TARGET_CHANNEL)
                      ? (uint8_t)targetChannel
                      : (isHopping && hopTable) ? hopTable[currentChannelIndex] : 0;

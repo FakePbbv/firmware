@@ -6,8 +6,6 @@ RF24 NRFradio(bruceConfigPins.NRF24_bus.io0, bruceConfigPins.NRF24_bus.cs);
 HardwareSerial NRFSerial = HardwareSerial(2); // Uses UART2 for External NRF's
 SPIClass *NRFSPI;
 
-static bool nrfRadioStarted = false; // guards nrf_stop() against touching an uninitialized radio
-
 void nrf_info() {
     tft.fillScreen(bruceConfig.bgColor);
     tft.setTextSize(FM);
@@ -54,8 +52,9 @@ bool nrf_start(NRF24_MODE mode) {
     digitalWrite(bruceConfigPins.NRF24_bus.io0, LOW);
     delay(5); // Let pins settle before SPI traffic
 
-    NRFSPI =
-        acquireSPIBus(bruceConfigPins.NRF24_bus.sck, bruceConfigPins.NRF24_bus.miso, bruceConfigPins.NRF24_bus.mosi);
+    NRFSPI = acquireSPIBus(
+        bruceConfigPins.NRF24_bus.sck, bruceConfigPins.NRF24_bus.miso, bruceConfigPins.NRF24_bus.mosi
+    );
     if (!NRFSPI) {
         Serial.println("No hardware SPI bus available for NRF24, falling back to default SPI");
         NRFSPI = &SPI;
@@ -68,18 +67,10 @@ bool nrf_start(NRF24_MODE mode) {
             rf24_gpio_pin_t(bruceConfigPins.NRF24_bus.cs)
         )) {
         result = true;
-        nrfRadioStarted = true;
     } else {
         return false;
     }
     return result;
-}
-
-void nrf_stop() {
-    if (!nrfRadioStarted) return;
-    NRFradio.stopConstCarrier();
-    NRFradio.powerDown();
-    nrfRadioStarted = false;
 }
 
 NRF24_MODE nrf_setMode() {
