@@ -34,7 +34,6 @@
 #include "core/radio_mem.h"
 #include "core/sd_functions.h"
 #include "core/utils.h"
-#include "ble_obex_send.h"
 #ifdef CONFIG_BT_NIMBLE_ENABLED
 #include "esp_mac.h"
 #if __has_include("host/ble_hs.h")
@@ -567,7 +566,6 @@ enum BleSpamAttackType {
     BLE_SPAM_ATTACK_WINDOWS_SWIFT_PAIR,
     BLE_SPAM_ATTACK_SAMSUNG,
     BLE_SPAM_ATTACK_BLE_BEACON,
-    BLE_SPAM_ATTACK_OBEX_FILE_PUSH,
     BLE_SPAM_ATTACK_RANDOM_ALL
 };
 
@@ -697,7 +695,6 @@ static const BleSpamAttackOption BLE_SPAM_ATTACK_OPTIONS[] = {
     {BLE_SPAM_ATTACK_WINDOWS_SWIFT_PAIR,    "Windows Swift Pair"   },
     {BLE_SPAM_ATTACK_SAMSUNG,               "Samsung BLE Spam"     },
     {BLE_SPAM_ATTACK_BLE_BEACON,            "BLE Beacon Spam"      },
-    {BLE_SPAM_ATTACK_OBEX_FILE_PUSH,        "Send File (OBEX)"     },
     {BLE_SPAM_ATTACK_RANDOM_ALL,            "Random / All"         }
 };
 
@@ -1054,7 +1051,6 @@ static int bleSpamGetDeviceCount(BleSpamAttackType type) {
             std::vector<String> saved = bleSpamLoadCustomNames("bs_bn");
             return nPresets + 1 + (int)saved.size() + 1; // presets + Random/All + saved + Add New
         }
-        case BLE_SPAM_ATTACK_OBEX_FILE_PUSH: return 1; // Single mode - scan and send
         default: return 0;
     }
 }
@@ -1081,8 +1077,6 @@ static const char *bleSpamGetDeviceName(BleSpamAttackType type, int index) {
             return "AirDrop Receive";
         case BLE_SPAM_ATTACK_AIRDROP_SEND:
             return "AirDrop Send";
-        case BLE_SPAM_ATTACK_OBEX_FILE_PUSH:
-            return "Send spam.png";
         case BLE_SPAM_ATTACK_APPLE_NOT_YOUR_DEVICE: {
             if (index >= 0 && index < APPLE_PROXIMITY_DEVICE_COUNT)
                 return APPLE_PROXIMITY_DEVICES[index].name;
@@ -1387,7 +1381,6 @@ static bool bleSpamBuildAdvertisementData(
             uint16_t deviceId = bleSpamResolveProximityDeviceId(deviceIndex);
             return buildAppleProximityPair(0x01, deviceId, advertisementData);
         }
-#if !defined(LITE_VERSION)
         case BLE_SPAM_ATTACK_AIRDROP_RECEIVE: {
             // AirDrop Receive (action 0x05) - triggers "Accept AirDrop from [Name]?" on victim
             uint8_t buf[31];
@@ -2287,12 +2280,6 @@ static void bleSpamMenuUi() {
         BleSpamSelection selection;
         selection.attack_type = bleSpamGetAttackTypeByIndex(attackIndex);
         selection.device_index = 0;
-
-        // OBEX File Push - uses Bluetooth Classic, not BLE
-        if (selection.attack_type == BLE_SPAM_ATTACK_OBEX_FILE_PUSH) {
-            obexSendFileMenu();
-            continue;
-        }
 
         // Types that go straight to config without a device list
         if (selection.attack_type == BLE_SPAM_ATTACK_RANDOM_ALL) {
