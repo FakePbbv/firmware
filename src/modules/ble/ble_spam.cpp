@@ -1311,7 +1311,7 @@ static bool bleSpamGetNextMac(BleSpamRunState &state, BleSpamMacRandMode mode, u
             outMac[1] = oui[1];
             outMac[2] = oui[2];
             esp_fill_random(&outMac[3], 3);
-            outMac[0] = (outMac[0] & 0xFE) | 0x02; // Locally administered, unicast
+            outMac[0] = (outMac[0] & 0x3F) | 0xC0; // Valid random-static address (bits 47:46 = 11)
         } else {
             bleSpamFastRandomMac(outMac);
         }
